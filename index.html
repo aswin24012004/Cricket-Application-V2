@@ -1,0 +1,1148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Pocket Stumps 3D</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-user-select:none}
+  html,body{margin:0;height:100%;background:#0b1a10;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;touch-action:none}
+  #wrap{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%)}
+  canvas{display:block;width:100%;height:100%}
+  #ov{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;text-align:center;
+      background:rgba(6,20,12,.88);color:#fff;padding:6%;gap:.7em}
+  #ov h1{margin:0;font-size:2em;letter-spacing:.04em}
+  #ov h2{margin:0;font-size:1.5em}
+  #ov p{margin:0;opacity:.85;font-size:1em;line-height:1.4}
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:.6em;width:100%;max-width:18em}
+  .btn{border:0;border-radius:.8em;padding:.8em 1em;font-size:1em;font-weight:700;color:#08210f;background:#7CFC9A;cursor:pointer}
+  .btn.alt{background:#ffd54a}
+  .btn.ghost{background:#ffffff22;color:#fff}
+  .btn:active{transform:scale(.96)}
+  #menuBtn{position:absolute;right:2%;top:1.2%;width:2.4em;height:2.4em;border-radius:50%;border:0;background:#ffffff22;color:#fff;font-size:1em;display:none;cursor:pointer}
+  .stat{font-size:.85em;opacity:.7}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <button id="menuBtn" onclick="quit()">✕</button>
+  <div id="ov"></div>
+</div>
+
+<script>
+"use strict";
+const W = 360, H = 640;
+const wrap = document.getElementById('wrap'), cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const ov = document.getElementById('ov'), menuBtn = document.getElementById('menuBtn');
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H), dpr = window.devicePixelRatio || 1;
+  wrap.style.width = W * s + 'px'; wrap.style.height = H * s + 'px';
+  cv.width = W * s * dpr; cv.height = H * s * dpr;
+  ctx.setTransform(s * dpr, 0, 0, s * dpr, 0, 0);
+  wrap.style.fontSize = (16 * s) + 'px';
+}
+addEventListener('resize', resize); resize();
+
+/* ---------- audio ---------- */
+let ac = null;
+function beep(f, d, type, vol) {
+  try {
+    ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type || 'sine'; o.frequency.value = f;
+    g.gain.value = vol || .08; g.gain.exponentialRampToValueAtTime(.0001, ac.currentTime + d);
+    o.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime + d);
+  } catch (e) {}
+}
+function buzz(ms) { try { navigator.vibrate && navigator.vibrate(ms); } catch (e) {} }
+
+/* ---------- pitch & accurate cricket positions ---------- */
+const PX = 130, PW = 100, PT = 175, PB = 575, PH = PB - PT; // pitch rect
+const STUMP_TOP_Y = PT + 14;   // 189: bowler's-end bowling crease & stumps
+const CREASE_TOP_Y = PT + 40;  // 215: bowler's-end popping crease
+const CREASE_BOT_Y = PB - 44;  // 531: striker's-end popping crease
+const STUMP_BOT_Y = PB - 14;   // 561: striker's-end bowling crease & stumps
+
+// Correct cricket positions:
+// Bowler runs up on the left side of the non-striker's stumps (over the wicket, x=161)
+// from behind the bowling crease (y=164) to his delivery stride at the popping crease (y=204),
+// releasing the ball from beside the stumps (x=173, y=206).
+const BOWL_X = 161, BOWL_START_Y = PT - 11, BOWL_DELIV_Y = CREASE_TOP_Y - 11;
+const RELEASE_X = 173, RELEASE_Y = CREASE_TOP_Y - 9;
+
+// Striker (batsman) stands IN FRONT of the batting stumps (STUMP_BOT_Y=561) at the popping crease (y=528),
+// in a side-on stance just to the leg side (x=165) with his bat guarding middle/off stump (x=180, y=529).
+const BAT_STAND_X = 165, BAT_STAND_Y = CREASE_BOT_Y - 3;
+const BAT_HIT_X = 180, BAT_HIT_Y = CREASE_BOT_Y - 2;
+
+const MY_KIT = '#1e6fd9', CPU_KIT = '#e8590c';
+// 6 fielders in authentic cricket positions around the oval
+const FIELD = [
+  [88, 210],  // Mid-off
+  [272, 210], // Mid-on
+  [54, 335],  // Extra cover
+  [306, 335], // Mid-wicket
+  [60, 468],  // Point
+  [300, 468]  // Square leg
+];
+
+const S = {
+  overs: 5, inn: 1, role: 'bat', runs: 0, wk: 0, balls: 0, target: 0,
+  userBatFirst: true, us: 0, cs: 0, uw: 0, cw: 0,
+  hist: [], phase: 'menu', prevPhase: 'menu', live: null, res: null, waitUntil: 0, swing: 0
+};
+const store = {
+  get() { try { return JSON.parse(localStorage.getItem('pocketstumps')) || { p: 0, w: 0, best: 0 }; } catch (e) { return { p: 0, w: 0, best: 0 }; } },
+  set(v) { try { localStorage.setItem('pocketstumps', JSON.stringify(v)); } catch (e) {} }
+};
+
+function pick(tbl) {
+  let r = Math.random(), a = 0;
+  for (const [k, p] of tbl) { a += p; if (r < a) return k; }
+  return tbl[tbl.length - 1][0];
+}
+const now = () => performance.now();
+
+/* ---------- menu / overlays ---------- */
+function showOv(html) { ov.innerHTML = html; ov.style.display = 'flex'; }
+function hideOv() { ov.style.display = 'none'; }
+
+function menu() {
+  S.phase = 'menu'; menuBtn.style.display = 'none';
+  const st = store.get();
+  showOv(`
+    <h1>🏏 POCKET STUMPS</h1>
+    <p>Choose match length</p>
+    <div class="grid">
+      ${[1, 2, 5, 10, 20].map(o => `<button class="btn" onclick="startMatch(${o})">${o}<br><small>over${o > 1 ? 's' : ''}</small></button>`).join('')}
+      <button class="btn ghost" onclick="howTo()">?<br><small>How</small></button>
+    </div>
+    <div class="stat">Played ${st.p} · Won ${st.w} · Best score ${st.best}</div>`);
+}
+function howTo() {
+  showOv(`
+    <h2>How to play</h2>
+    <p><b>Batting:</b> a ring flashes for a split second near your bat in front of the stumps. Tap as it closes. Only near-perfect timing gives a 4 or 6; early or late means dots, singles or a wicket.</p>
+    <p><b>Bowling:</b> watch the colour bar at the top right and tap to lock in a colour. The bowler then runs in and releases the ball!<br>
+    🟢 Green = 0, 1, 2 runs (centre of green can take a wicket)<br>
+    🟡 Yellow = 2 or 3 runs<br>
+    🔴 Red = 4 or 6 runs</p>
+    <button class="btn" onclick="menu()">Got it</button>`);
+}
+function quit() {
+  if (S.phase === 'menu') return;
+  S.prevPhase = S.phase;
+  S.phase = 'pause';
+  showOv(`
+    <h2>Quit match?</h2>
+    <p>Your current match progress will be lost.</p>
+    <div style="display:flex;gap:.8em">
+      <button class="btn" onclick="menu()">Quit</button>
+      <button class="btn ghost" onclick="resumeMatch()">Resume</button>
+    </div>`);
+}
+function resumeMatch() {
+  hideOv();
+  if (S.prevPhase === 'wait' || S.prevPhase === 'live') queueBall(600);
+  else S.phase = S.prevPhase;
+}
+
+function startMatch(o) {
+  S.overs = o; S.userBatFirst = Math.random() < .5; S.us = S.cs = S.uw = S.cw = 0;
+  menuBtn.style.display = 'block';
+  showOv(`
+    <h2>${o} over match</h2>
+    <p>${S.userBatFirst ? 'You won the toss and will <b>bat</b> first.' : 'CPU won the toss and will bat first. You <b>bowl</b>.'}</p>
+    <button class="btn" onclick="startInnings(1)">Play</button>`);
+}
+
+function startInnings(n) {
+  S.inn = n; S.role = ((n === 1) === S.userBatFirst) ? 'bat' : 'bowl';
+  S.runs = 0; S.wk = 0; S.balls = 0; S.hist = []; S.res = null; S.live = null;
+  hideOv(); queueBall(900);
+}
+
+function queueBall(ms) { S.phase = 'wait'; S.waitUntil = now() + ms; }
+
+const BAT_REL_T = 0.22; // fraction of batting delivery when bowler releases the ball
+const BOWL_RUNUP_MS = 280; // ms from colour selection to ball release
+const BOWL_FLIGHT_MS = 520; // ms for released ball to travel from bowler to batter
+
+function beginBall() {
+  S.phase = 'live';
+  if (S.role === 'bat') {
+    S.live = {
+      t0: now(),
+      D: 880 + Math.random() * 360,
+      sway: (Math.random() - .5) * 28,
+      bounceP: 0.38 + Math.random() * 0.3,
+      done: false
+    };
+  } else {
+    S.live = {
+      t0: now(),
+      speed: .52 + Math.random() * .38,
+      ph: Math.random(),
+      released: false,
+      selectT: 0,
+      p: null,
+      z: null,
+      outcome: null,
+      done: false
+    };
+  }
+}
+
+/* ---------- input ---------- */
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  if (S.phase !== 'live' || !S.live || S.live.done) return;
+  if (S.role === 'bat') {
+    const tt = (now() - S.live.t0) / S.live.D;
+    if (tt < BAT_REL_T) return; // cannot hit before the ball is released
+    resolveBat();
+  } else {
+    if (!S.live.released) resolveBowl();
+  }
+});
+
+/* ---------- batting ---------- */
+const IDEAL = .86;
+function resolveBat(missed) {
+  const L = S.live, t = (now() - L.t0) / L.D, e = t - IDEAL, a = Math.abs(e);
+  S.swing = now();
+  let val, tag;
+  if (missed) { val = pick([['W', .65], [0, .35]]); tag = 'Missed!'; }
+  else if (a < .042) { val = pick([[6, .35], [4, .4], [2, .1], ['W', .15]]); tag = 'Perfect!'; }
+  else if (a < .075) { val = pick([[4, .22], [6, .04], [2, .24], [3, .08], [1, .22], [0, .08], ['W', .12]]); tag = 'Good'; }
+  else if (a < .125) { val = pick([[1, .32], [2, .2], [0, .18], [4, .04], ['W', .26]]); tag = 'Okay'; }
+  else if (a < .28) { val = pick([[0, .35], [1, .25], [2, .05], ['W', .35]]); tag = e < 0 ? 'Too early' : 'Too late'; }
+  else { val = pick([[0, .75], ['W', .25]]); tag = 'Swing & miss'; }
+  const ang = (-90 + Math.max(-65, Math.min(65, e * 520)) + (Math.random() - .5) * 24) * Math.PI / 180;
+  const dist = val === 6 ? 520 : val === 4 ? 420 : (typeof val === 'number' && val > 0) ? 90 + val * 28 : 25;
+  finishBall(val, tag, { ang, dist, from: { x: BAT_HIT_X, y: BAT_HIT_Y } });
+}
+
+/* ---------- bowling ---------- */
+function markerP() {
+  const L = S.live;
+  if (L && L.released && L.p !== null) return L.p;
+  const x = (now() - L.t0) / 1000 * L.speed + L.ph;
+  return Math.abs(2 * (x % 1) - 1);
+}
+function zoneOf(p) { return (p < .18 || p > .82) ? 'red' : (p < .33 || p > .67) ? 'yellow' : 'green'; }
+
+function resolveBowl() {
+  const p = markerP(), z = zoneOf(p), perfect = Math.abs(p - .5) < .04;
+  let val;
+  if (z === 'green') val = perfect ? pick([['W', .4], [0, .4], [1, .2]]) : pick([['W', .12], [0, .4], [1, .35], [2, .13]]);
+  else if (z === 'yellow') val = pick([['W', .06], [1, .2], [2, .42], [3, .32]]);
+  else val = pick([[4, .58], [6, .42]]);
+  const tag = z === 'green' ? (perfect ? 'Perfect length!' : 'Green') : z === 'yellow' ? 'Yellow' : 'Red';
+  const dist = val === 6 ? 520 : val === 4 ? 420 : (typeof val === 'number' && val > 0) ? 90 + val * 28 : 25;
+  const ang = (-90 + (Math.random() - .5) * 120) * Math.PI / 180;
+
+  // Lock in colour selection first; bowler then runs in and releases the ball!
+  S.live.p = p;
+  S.live.z = z;
+  S.live.released = true;
+  S.live.selectT = now();
+  S.live.outcome = {
+    val,
+    tag,
+    flight: { ang, dist, from: { x: BAT_HIT_X, y: BAT_HIT_Y }, p, z }
+  };
+  beep(520, .05, 'sine', .05);
+}
+
+/* ---------- ball result ---------- */
+function finishBall(val, tag, flight) {
+  S.live.done = true;
+  S.balls++;
+  const wicket = val === 'W';
+  if (wicket) S.wk++; else S.runs += val;
+  S.hist.push(val);
+  const color = wicket ? '#ff5252' : val === 6 ? '#ffd54a' : val === 4 ? '#7CFC9A' : '#ffffff';
+  const text = wicket ? 'OUT!' : val === 6 ? 'SIX!' : val === 4 ? 'FOUR!' : val === 0 ? 'DOT' : val + (val === 1 ? ' RUN' : ' RUNS');
+  S.res = { text, tag, color, until: now() + 1150, t0: now(), val, flight };
+  S.phase = 'result';
+  if (wicket) { beep(140, .4, 'sawtooth', .1); buzz(120); }
+  else if (val >= 4) { beep(660, .15, 'triangle'); setTimeout(() => beep(880, .2, 'triangle'), 110); buzz(40); }
+  else beep(420, .08, 'square', .05);
+}
+
+function afterResult() {
+  const over = S.wk >= 10 || S.balls >= S.overs * 6 || (S.inn === 2 && S.runs >= S.target);
+  if (over) endInnings(); else queueBall(450);
+}
+
+function endInnings() {
+  S.phase = 'overlay';
+  if (S.role === 'bat') { S.us = S.runs; S.uw = S.wk; } else { S.cs = S.runs; S.cw = S.wk; }
+  if (S.inn === 1) {
+    S.target = S.runs + 1;
+    showOv(`
+      <h2>Innings over</h2>
+      <p style="font-size:1.6em"><b>${S.runs}/${S.wk}</b></p>
+      <p>Target: <b>${S.target}</b> in ${S.overs} over${S.overs > 1 ? 's' : ''}</p>
+      <p>${S.role === 'bat' ? 'Now you <b>bowl</b> and defend it.' : 'Now you <b>bat</b> and chase it.'}</p>
+      <button class="btn" onclick="startInnings(2)">Continue</button>`);
+    return;
+  }
+  let msg, win = false;
+  if (S.role === 'bat') {
+    if (S.runs >= S.target) { win = true; msg = `You won by ${10 - S.wk} wicket${10 - S.wk === 1 ? '' : 's'}!`; }
+    else if (S.runs === S.target - 1) msg = 'Match tied!';
+    else msg = `You lost by ${S.target - 1 - S.runs} run${S.target - 1 - S.runs === 1 ? '' : 's'}.`;
+  } else {
+    if (S.runs >= S.target) msg = `CPU won by ${10 - S.wk} wicket${10 - S.wk === 1 ? '' : 's'}.`;
+    else if (S.runs === S.target - 1) msg = 'Match tied!';
+    else { win = true; msg = `You won by ${S.target - 1 - S.runs} runs!`; }
+  }
+  const st = store.get(); st.p++; if (win) st.w++; st.best = Math.max(st.best, S.us); store.set(st);
+  showOv(`
+    <h1>${win ? '🏆' : '🏏'}</h1>
+    <h2>${msg}</h2>
+    <p>You: <b>${S.us}/${S.uw}</b> &nbsp;·&nbsp; CPU: <b>${S.cs}/${S.cw}</b></p>
+    <button class="btn" onclick="startMatch(${S.overs})">Rematch</button>
+    <button class="btn alt" onclick="menu()">Menu</button>`);
+}
+
+/* ---------- update ---------- */
+function update() {
+  const t = now();
+  if (S.phase === 'wait' && t >= S.waitUntil) beginBall();
+  else if (S.phase === 'live' && S.live && !S.live.done) {
+    if (S.role === 'bat') {
+      if ((t - S.live.t0) / S.live.D > 1.02) resolveBat(true);
+    } else if (S.live.released) {
+      const elapsed = t - S.live.selectT;
+      if (elapsed >= BOWL_RUNUP_MS + BOWL_FLIGHT_MS) {
+        S.swing = t;
+        const out = S.live.outcome;
+        finishBall(out.val, out.tag, out.flight);
+      }
+    }
+  } else if (S.phase === 'result' && t >= S.res.until) afterResult();
+}
+
+/* ---------- Three.js 3D Character & Wicket Engine ---------- */
+let threeCtx = null;
+
+function initThree3D() {
+  if (typeof THREE === 'undefined') return null;
+  try {
+    const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+    renderer.setSize(W * 2, H * 2, false);
+    const scene = new THREE.Scene();
+    const camera = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, 1, 1000);
+    camera.position.set(0, 0, 500);
+    camera.lookAt(0, 0, 0);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.58));
+    const hemi = new THREE.HemisphereLight(0xe8f7ff, 0x1b4d27, 0.45);
+    hemi.position.set(0, 200, 300);
+    scene.add(hemi);
+    const sun = new THREE.DirectionalLight(0xfff9e6, 0.92);
+    sun.position.set(130, 180, 340);
+    scene.add(sun);
+    const rim = new THREE.DirectionalLight(0x90caf9, 0.35);
+    rim.position.set(-150, -120, 200);
+    scene.add(rim);
+
+    const mats = {
+      skin: new THREE.MeshStandardMaterial({ color: 0xe0ac7e, roughness: 0.55, metalness: 0.05 }),
+      white: new THREE.MeshStandardMaterial({ color: 0xf5f7fa, roughness: 0.45, metalness: 0.05 }),
+      pad: new THREE.MeshStandardMaterial({ color: 0xfafafa, roughness: 0.35, metalness: 0.08 }),
+      shoe: new THREE.MeshStandardMaterial({ color: 0x263238, roughness: 0.5, metalness: 0.2 }),
+      wood: new THREE.MeshStandardMaterial({ color: 0xe5c178, roughness: 0.4, metalness: 0.08 }),
+      stump: new THREE.MeshStandardMaterial({ color: 0xf2dfb3, roughness: 0.38, metalness: 0.08 }),
+      grip: new THREE.MeshStandardMaterial({ color: 0x3e2723, roughness: 0.65 }),
+      grille: new THREE.MeshStandardMaterial({ color: 0xcfd8dc, roughness: 0.25, metalness: 0.8 }),
+      dark: new THREE.MeshStandardMaterial({ color: 0x1c1c1c, roughness: 0.7 }),
+      ball: new THREE.MeshStandardMaterial({ color: 0xc62828, roughness: 0.25, metalness: 0.15 }),
+      seam: new THREE.MeshStandardMaterial({ color: 0xfff8e1, roughness: 0.4 }),
+      shadow: new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.28 })
+    };
+
+    function makeShadow(rx, ry) {
+      const g = new THREE.CircleGeometry(1, 24);
+      const m = new THREE.Mesh(g, mats.shadow);
+      m.scale.set(rx, ry, 1);
+      m.position.set(0, 0, -2);
+      return m;
+    }
+
+    function createBatterRig() {
+      const wrap = new THREE.Group();
+      const shadow = makeShadow(18, 7);
+      wrap.add(shadow);
+
+      // Pivot at feet (0, 0, 0), tilted so camera sees 3D height & depth
+      const root = new THREE.Group();
+      root.rotation.x = -0.36;
+      wrap.add(root);
+
+      const kitMat = new THREE.MeshStandardMaterial({ color: 0x1e6fd9, roughness: 0.4, metalness: 0.1 });
+      const trimMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.4 });
+
+      // Side-on stance group rotated ~38 deg so batter stands sideways to the crease facing off-side/bowler
+      const body = new THREE.Group();
+      body.rotation.y = 0.62;
+      root.add(body);
+
+      // Left (front) and Right (back) legs with 3D moulded batting pads
+      function makePaddedLeg(lx, lz) {
+        const leg = new THREE.Group();
+        leg.position.set(lx, 0, lz);
+        const shoe = new THREE.Mesh(new THREE.BoxGeometry(7.5, 4.5, 11), mats.shoe);
+        shoe.position.set(0, 2.2, 2);
+        leg.add(shoe);
+        const thigh = new THREE.Mesh(new THREE.CylinderGeometry(4.2, 3.6, 22, 14), mats.white);
+        thigh.position.set(0, 14, 0);
+        leg.add(thigh);
+        // 3D contoured batting pad on front of shin & knee roll
+        const padShell = new THREE.Mesh(new THREE.CylinderGeometry(4.6, 4.1, 20, 14), mats.pad);
+        padShell.position.set(0, 13, 1.6);
+        leg.add(padShell);
+        const kneeRoll = new THREE.Mesh(new THREE.SphereGeometry(4.6, 14, 12), mats.pad);
+        kneeRoll.scale.set(1, 0.75, 0.9);
+        kneeRoll.position.set(0, 22.5, 1.8);
+        leg.add(kneeRoll);
+        return leg;
+      }
+      const backLeg = makePaddedLeg(-4.8, -3.5);
+      const frontLeg = makePaddedLeg(4.8, 3.5);
+      body.add(backLeg, frontLeg);
+
+      // Hips & Torso
+      const hips = new THREE.Mesh(new THREE.CylinderGeometry(8.5, 7.8, 9, 16), mats.white);
+      hips.position.set(0, 26, 0);
+      body.add(hips);
+
+      const torso = new THREE.Group();
+      torso.position.set(0, 30, 0);
+      body.add(torso);
+
+      const chest = new THREE.Mesh(new THREE.CylinderGeometry(10.2, 8.5, 20, 18), kitMat);
+      chest.scale.set(1.12, 1, 0.78);
+      chest.position.set(0, 10, 0);
+      torso.add(chest);
+
+      const stripe = new THREE.Mesh(new THREE.CylinderGeometry(10.4, 9.9, 3.2, 18), trimMat);
+      stripe.scale.set(1.12, 1, 0.79);
+      stripe.position.set(0, 8, 0);
+      torso.add(stripe);
+
+      const shoulders = new THREE.Mesh(new THREE.SphereGeometry(10.2, 16, 12), kitMat);
+      shoulders.scale.set(1.15, 0.45, 0.78);
+      shoulders.position.set(0, 19.5, 0);
+      torso.add(shoulders);
+
+      // Head & 3D Helmet turned toward bowler
+      const headGroup = new THREE.Group();
+      headGroup.position.set(0, 23, 0);
+      headGroup.rotation.y = -0.58; // Look straight up the pitch at the bowler
+      torso.add(headGroup);
+
+      const neck = new THREE.Mesh(new THREE.CylinderGeometry(3.5, 4, 5, 12), mats.skin);
+      neck.position.set(0, 1.5, 0);
+      headGroup.add(neck);
+
+      const head = new THREE.Mesh(new THREE.SphereGeometry(7.8, 18, 16), mats.skin);
+      head.position.set(0, 8.5, 0);
+      headGroup.add(head);
+
+      const helmetDome = new THREE.Mesh(new THREE.SphereGeometry(8.6, 18, 14, 0, Math.PI * 2, 0, Math.PI * 0.62), kitMat);
+      helmetDome.position.set(0, 9.2, -0.3);
+      headGroup.add(helmetDome);
+
+      const visor = new THREE.Mesh(new THREE.CylinderGeometry(8.8, 9.2, 2.2, 16, 1, false, -Math.PI * 0.42, Math.PI * 0.84), kitMat);
+      visor.position.set(0, 8.5, 2.2);
+      visor.rotation.x = 0.25;
+      headGroup.add(visor);
+
+      const grille = new THREE.Mesh(new THREE.TorusGeometry(6.8, 0.65, 8, 16, Math.PI * 0.75), mats.grille);
+      grille.position.set(0, 5.8, 3.2);
+      grille.rotation.x = Math.PI * 0.5;
+      grille.rotation.z = -Math.PI * 0.375;
+      headGroup.add(grille);
+
+      // Arms, Gloves & 3D Cricket Bat
+      const batPivot = new THREE.Group();
+      batPivot.position.set(7.5, 16, 5);
+      torso.add(batPivot);
+
+      const leadShoulder = new THREE.Mesh(new THREE.SphereGeometry(4.2, 12, 12), kitMat);
+      batPivot.add(leadShoulder);
+
+      const upperArm = new THREE.Mesh(new THREE.CylinderGeometry(3.2, 2.8, 13, 12), mats.skin);
+      upperArm.position.set(1.5, -6.5, 2);
+      upperArm.rotation.z = 0.18;
+      batPivot.add(upperArm);
+
+      const hands = new THREE.Group();
+      hands.position.set(3, -13, 4);
+      batPivot.add(hands);
+
+      const glove1 = new THREE.Mesh(new THREE.SphereGeometry(3.8, 12, 12), mats.white);
+      const glove2 = new THREE.Mesh(new THREE.SphereGeometry(3.6, 12, 12), mats.white);
+      glove2.position.set(0, -3.2, 0.8);
+      hands.add(glove1, glove2);
+
+      // 3D Cricket Bat (handle + V-splice + willow blade with raised spine)
+      const batGroup = new THREE.Group();
+      hands.add(batGroup);
+
+      const handle = new THREE.Mesh(new THREE.CylinderGeometry(1.3, 1.3, 12, 10), mats.grip);
+      handle.position.set(0, -4, 0);
+      batGroup.add(handle);
+
+      const blade = new THREE.Mesh(new THREE.BoxGeometry(5.8, 25, 2.4), mats.wood);
+      blade.position.set(0, -21, 0);
+      batGroup.add(blade);
+
+      const spine = new THREE.Mesh(new THREE.CylinderGeometry(0.8, 1.6, 24, 6), mats.wood);
+      spine.position.set(0, -21, -1.2);
+      batGroup.add(spine);
+
+      return { wrap, root, body, torso, batPivot, hands, batGroup, kitMat };
+    }
+
+    function createBowlerRig(isFielder) {
+      const wrap = new THREE.Group();
+      const shadow = makeShadow(isFielder ? 14 : 16, isFielder ? 5.5 : 6.5);
+      wrap.add(shadow);
+
+      const root = new THREE.Group();
+      root.rotation.x = -0.36;
+      wrap.add(root);
+
+      const kitMat = new THREE.MeshStandardMaterial({ color: 0xe8590c, roughness: 0.42, metalness: 0.08 });
+      const trimMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.4 });
+
+      const body = new THREE.Group();
+      root.add(body);
+
+      function makeLeg(lx) {
+        const legPivot = new THREE.Group();
+        legPivot.position.set(lx, 24, 0);
+        const pant = new THREE.Mesh(new THREE.CylinderGeometry(3.8, 3.1, 22, 12), mats.white);
+        pant.position.set(0, -11, 0);
+        legPivot.add(pant);
+        const shoe = new THREE.Mesh(new THREE.BoxGeometry(6.5, 4, 9.5), mats.shoe);
+        shoe.position.set(0, -22, 2);
+        legPivot.add(shoe);
+        return legPivot;
+      }
+      const leftLeg = makeLeg(-4.5);
+      const rightLeg = makeLeg(4.5);
+      body.add(leftLeg, rightLeg);
+
+      const hips = new THREE.Mesh(new THREE.CylinderGeometry(8, 7.2, 8, 14), mats.white);
+      hips.position.set(0, 25, 0);
+      body.add(hips);
+
+      const torso = new THREE.Group();
+      torso.position.set(0, 28, 0);
+      body.add(torso);
+
+      const chest = new THREE.Mesh(new THREE.CylinderGeometry(9.6, 8, 19, 16), kitMat);
+      chest.scale.set(1.1, 1, 0.76);
+      chest.position.set(0, 9.5, 0);
+      torso.add(chest);
+
+      const stripe = new THREE.Mesh(new THREE.CylinderGeometry(9.8, 9.3, 3, 16), trimMat);
+      stripe.scale.set(1.1, 1, 0.77);
+      stripe.position.set(0, 8, 0);
+      torso.add(stripe);
+
+      // Head & 3D Cap
+      const headGroup = new THREE.Group();
+      headGroup.position.set(0, 21.5, 0);
+      torso.add(headGroup);
+
+      const head = new THREE.Mesh(new THREE.SphereGeometry(7.2, 16, 14), mats.skin);
+      head.position.set(0, 7, 0);
+      headGroup.add(head);
+
+      const capDome = new THREE.Mesh(new THREE.SphereGeometry(7.6, 16, 12, 0, Math.PI * 2, 0, Math.PI * 0.55), kitMat);
+      capDome.position.set(0, 7.6, 0);
+      headGroup.add(capDome);
+
+      const capPeak = new THREE.Mesh(new THREE.BoxGeometry(10, 1.4, 6), kitMat);
+      capPeak.position.set(0, 7.2, 5.8);
+      capPeak.rotation.x = 0.18;
+      headGroup.add(capPeak);
+
+      // Left (front/balance) arm
+      const leftArmPivot = new THREE.Group();
+      leftArmPivot.position.set(-10.5, 17, 0);
+      torso.add(leftArmPivot);
+      const leftSleeve = new THREE.Mesh(new THREE.SphereGeometry(3.8, 10, 10), kitMat);
+      leftArmPivot.add(leftSleeve);
+      const leftArmMesh = new THREE.Mesh(new THREE.CylinderGeometry(2.8, 2.3, 17, 10), mats.skin);
+      leftArmPivot.add(leftArmMesh);
+      leftArmMesh.position.set(0, -8.5, 0);
+
+      // Right (bowling) arm
+      const rightArmPivot = new THREE.Group();
+      rightArmPivot.position.set(10.5, 17, 0);
+      torso.add(rightArmPivot);
+      const rightSleeve = new THREE.Mesh(new THREE.SphereGeometry(3.8, 10, 10), kitMat);
+      rightArmPivot.add(rightSleeve);
+      const rightArmMesh = new THREE.Mesh(new THREE.CylinderGeometry(2.8, 2.3, 19, 10), mats.skin);
+      rightArmMesh.position.set(0, -9.5, 0);
+      rightArmPivot.add(rightArmMesh);
+
+      return { wrap, root, body, torso, leftLeg, rightLeg, leftArmPivot, rightArmPivot, kitMat };
+    }
+
+    function createStumpsRig() {
+      const wrap = new THREE.Group();
+      const root = new THREE.Group();
+      root.rotation.x = -0.36;
+      wrap.add(root);
+
+      const stumps = [];
+      for (let i = -1; i <= 1; i++) {
+        const s = new THREE.Mesh(new THREE.CylinderGeometry(1.45, 1.55, 22, 10), mats.stump);
+        s.position.set(i * 7, 11, 0);
+        root.add(s);
+        stumps.push(s);
+      }
+      const bails = [];
+      for (const bx of [-3.5, 3.5]) {
+        const b = new THREE.Mesh(new THREE.CylinderGeometry(0.9, 0.9, 6.8, 8), mats.white);
+        b.rotation.z = Math.PI / 2;
+        b.position.set(bx, 22.6, 0);
+        root.add(b);
+        bails.push(b);
+      }
+      return { wrap, root, stumps, bails };
+    }
+
+    function createBallRig() {
+      const wrap = new THREE.Group();
+      const shadow = makeShadow(5, 2.6);
+      wrap.add(shadow);
+      const meshGroup = new THREE.Group();
+      wrap.add(meshGroup);
+      const sphere = new THREE.Mesh(new THREE.SphereGeometry(1, 18, 16), mats.ball);
+      meshGroup.add(sphere);
+      const seam = new THREE.Mesh(new THREE.TorusGeometry(0.98, 0.09, 8, 20), mats.seam);
+      seam.rotation.x = 0.8;
+      meshGroup.add(seam);
+      return { wrap, shadow, meshGroup };
+    }
+
+    const batterRig = createBatterRig();
+    const bowlerRig = createBowlerRig(false);
+    const fielderRigs = FIELD.map(() => createBowlerRig(true));
+    const topStumps = createStumpsRig();
+    const botStumps = createStumpsRig();
+    const ballRig = createBallRig();
+
+    scene.add(topStumps.wrap, bowlerRig.wrap, ...fielderRigs.map(f => f.wrap), batterRig.wrap, botStumps.wrap, ballRig.wrap);
+
+    return {
+      renderer, scene, camera,
+      batterRig, bowlerRig, fielderRigs, topStumps, botStumps, ballRig
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+threeCtx = initThree3D();
+
+function setCanvasPos(group, cx, cy, zOrder) {
+  group.position.set(cx - W / 2, H / 2 - cy, zOrder || 0);
+}
+
+/* ---------- 2D Canvas 3D-Shaded Fallback Helpers ---------- */
+const SKIN = '#e0ac7e';
+function rr(x, y, w, h, r) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h); }
+function shade(x, y, rx, ry) {
+  ctx.fillStyle = 'rgba(0,0,0,.28)';
+  ctx.beginPath(); ctx.ellipse(x, y, rx, ry || 5, 0, 0, 7); ctx.fill();
+}
+
+function stumps2D(x, y, brokenT) {
+  ctx.save();
+  ctx.translate(x, y);
+  shade(0, 1, 13, 3.5);
+  for (let i = -1; i <= 1; i++) {
+    ctx.save();
+    const sx = i * 7;
+    if (brokenT > 0 && i >= 0) {
+      ctx.translate(sx, 0);
+      ctx.rotate((i === 0 ? 0.45 : -0.35) * brokenT);
+      const g = ctx.createLinearGradient(-2, 0, 2, 0);
+      g.addColorStop(0, '#fff3d1'); g.addColorStop(0.5, '#e6cb8e'); g.addColorStop(1, '#b59452');
+      ctx.fillStyle = g;
+      rr(-1.8, -22, 3.6, 22, 1.5); ctx.fill();
+    } else {
+      const g = ctx.createLinearGradient(sx - 2, 0, sx + 2, 0);
+      g.addColorStop(0, '#fff3d1'); g.addColorStop(0.5, '#e6cb8e'); g.addColorStop(1, '#b59452');
+      ctx.fillStyle = g;
+      rr(sx - 1.8, -22, 3.6, 22, 1.5); ctx.fill();
+    }
+    ctx.restore();
+  }
+  ctx.fillStyle = '#fff';
+  if (brokenT > 0) {
+    ctx.fillRect(-10 - brokenT * 8, -24 - brokenT * 14, 9, 2.5);
+    ctx.fillRect(1 + brokenT * 10, -24 - brokenT * 18, 9, 2.5);
+  } else {
+    ctx.fillRect(-10, -24, 20, 2.6);
+  }
+  ctx.restore();
+}
+
+function ball3DCanvas(x, y, r, lift, c) {
+  lift = lift || 0;
+  if (lift > 0.5) {
+    ctx.fillStyle = 'rgba(0,0,0,.26)';
+    ctx.beginPath(); ctx.ellipse(x, y + 2, Math.max(2, r * 0.75), Math.max(1.2, r * 0.4), 0, 0, 7); ctx.fill();
+  }
+  const by = y - lift;
+  const grad = ctx.createRadialGradient(x - r * 0.35, by - r * 0.35, r * 0.1, x, by, r);
+  grad.addColorStop(0, '#ff6b6b');
+  grad.addColorStop(0.45, c || '#c62828');
+  grad.addColorStop(1, '#6b0f0f');
+  ctx.beginPath(); ctx.arc(x, by, r, 0, 7); ctx.fillStyle = grad; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.78)'; ctx.lineWidth = Math.max(1, r * 0.16);
+  ctx.beginPath(); ctx.arc(x, by, r * .72, .5, 2.6); ctx.stroke();
+}
+
+function batterFallback(x, y, kit, swing, s) {
+  s = s || 1; ctx.save(); ctx.translate(x, y); ctx.scale(s, s); ctx.lineCap = 'round';
+  shade(2, 2, 18, 6);
+  for (const [dx, dy] of [[-5, -2], [5, 2]]) {
+    const pg = ctx.createLinearGradient(dx - 5, 0, dx + 5, 0);
+    pg.addColorStop(0, '#ffffff'); pg.addColorStop(0.6, '#eceff1'); pg.addColorStop(1, '#b0bec5');
+    ctx.fillStyle = pg; rr(dx - 4.5, dy - 22, 9, 22, 4); ctx.fill();
+    ctx.fillStyle = '#263238'; rr(dx - 5, dy - 3, 10.5, 4.5, 2); ctx.fill();
+  }
+  const tg = ctx.createLinearGradient(-11, 0, 11, 0);
+  tg.addColorStop(0, kit); tg.addColorStop(0.35, kit); tg.addColorStop(1, '#0d254c');
+  ctx.fillStyle = tg; rr(-10, -44, 20, 24, 7); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,.9)'; ctx.fillRect(-10, -31, 20, 3);
+  const hg = ctx.createRadialGradient(-2, -54, 1, 0, -52, 9);
+  hg.addColorStop(0, '#f3c69f'); hg.addColorStop(1, '#b87d4b');
+  ctx.fillStyle = hg; ctx.beginPath(); ctx.arc(0, -52, 8, 0, 7); ctx.fill();
+  ctx.fillStyle = kit; ctx.beginPath(); ctx.arc(0, -54, 9.5, Math.PI * 0.95, 0.15); ctx.fill();
+  ctx.strokeStyle = '#cfd8dc'; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.moveTo(2, -50); ctx.lineTo(9, -50); ctx.moveTo(2, -47); ctx.lineTo(8, -47); ctx.stroke();
+  ctx.save(); ctx.translate(8, -32);
+  const sw = swing === null ? 0 : Math.sin(swing * Math.PI * 0.85);
+  ctx.rotate(0.35 - sw * 2.3);
+  ctx.fillStyle = '#3e2723'; rr(-1.5, 0, 3, 9, 1.5); ctx.fill();
+  const bg = ctx.createLinearGradient(-4, 0, 4, 0);
+  bg.addColorStop(0, '#f5d799'); bg.addColorStop(0.5, '#deb870'); bg.addColorStop(1, '#9c7432');
+  ctx.fillStyle = bg; rr(-3.5, 8, 7, 23, 2); ctx.fill();
+  ctx.restore();
+  ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(8, -32, 3.8, 0, 7); ctx.fill();
+  ctx.restore();
+}
+
+function bowlerFallback(x, y, kit, ph, s) {
+  s = s || 1; ctx.save(); ctx.translate(x, y); ctx.scale(s, s); ctx.lineCap = 'round';
+  shade(0, 2, 15, 5);
+  const stride = Math.sin(ph * Math.PI * 2) * 4;
+  ctx.fillStyle = '#eceff1';
+  rr(-8, -22 + stride, 7, 22, 3); ctx.fill();
+  rr(1, -22 - stride, 7, 22, 3); ctx.fill();
+  ctx.fillStyle = '#263238';
+  rr(-8.5, -3 + stride, 8, 4.5, 2); ctx.fill();
+  rr(0.5, -3 - stride, 8, 4.5, 2); ctx.fill();
+  ctx.fillStyle = kit; rr(-11, -44, 22, 24, 7); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,.9)'; ctx.fillRect(-11, -31, 22, 3);
+  ctx.fillStyle = SKIN; ctx.beginPath(); ctx.arc(0, -52, 8, 0, 7); ctx.fill();
+  ctx.fillStyle = kit; ctx.beginPath(); ctx.arc(0, -54, 8.5, Math.PI, 0); ctx.fill();
+  const a = Math.PI / 2 + ph * Math.PI * 2;
+  const hx = 10 + Math.cos(a) * 18, hy = -38 + Math.sin(a) * 18;
+  ctx.strokeStyle = SKIN; ctx.lineWidth = 4.5;
+  ctx.beginPath(); ctx.moveTo(10, -38); ctx.lineTo(hx, hy); ctx.stroke();
+  ctx.restore();
+}
+
+/* ---------- HUD & Meter ---------- */
+function drawField() {
+  for (let i = 0; i < 16; i++) { ctx.fillStyle = i % 2 ? '#2f8f46' : '#2a8340'; ctx.fillRect(0, i * 40, W, 40); }
+  ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.ellipse(W / 2, 360, 172, 300, 0, 0, Math.PI * 2); ctx.stroke();
+
+  // Pitch surface with subtle worn crease shading
+  const pg = ctx.createLinearGradient(PX, PT, PX + PW, PT);
+  pg.addColorStop(0, '#cfb580'); pg.addColorStop(0.5, '#dfca98'); pg.addColorStop(1, '#cfb580');
+  ctx.fillStyle = pg; ctx.fillRect(PX, PT, PW, PH);
+
+  // Bowling, popping, and return creases at both ends
+  ctx.strokeStyle = 'rgba(255,255,255,.9)'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  // Top (bowler's end) bowling & popping creases + return creases
+  ctx.moveTo(PX + 10, STUMP_TOP_Y); ctx.lineTo(PX + PW - 10, STUMP_TOP_Y);
+  ctx.moveTo(PX - 8, CREASE_TOP_Y); ctx.lineTo(PX + PW + 8, CREASE_TOP_Y);
+  ctx.moveTo(PX + 10, PT + 4); ctx.lineTo(PX + 10, CREASE_TOP_Y);
+  ctx.moveTo(PX + PW - 10, PT + 4); ctx.lineTo(PX + PW - 10, CREASE_TOP_Y);
+  // Bottom (striker's end) popping & bowling creases + return creases
+  ctx.moveTo(PX - 8, CREASE_BOT_Y); ctx.lineTo(PX + PW + 8, CREASE_BOT_Y);
+  ctx.moveTo(PX + 10, STUMP_BOT_Y); ctx.lineTo(PX + PW - 10, STUMP_BOT_Y);
+  ctx.moveTo(PX + 10, CREASE_BOT_Y); ctx.lineTo(PX + 10, PB - 4);
+  ctx.moveTo(PX + PW - 10, CREASE_BOT_Y); ctx.lineTo(PX + PW - 10, PB - 4);
+  ctx.stroke();
+}
+
+function hud() {
+  ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(0, 0, W, 84);
+  ctx.fillStyle = '#fff'; ctx.textAlign = 'left';
+  ctx.font = '600 12px system-ui'; ctx.fillText(S.role === 'bat' ? 'YOU BAT' : 'YOU BOWL', 12, 20);
+  ctx.font = '800 30px system-ui'; ctx.fillText(S.runs + '/' + S.wk, 12, 52);
+  const ov_ = Math.floor(S.balls / 6) + '.' + (S.balls % 6);
+  ctx.textAlign = 'center'; ctx.font = '600 12px system-ui'; ctx.fillText('OVERS', 190, 20);
+  ctx.font = '700 20px system-ui'; ctx.fillText(ov_ + ' / ' + S.overs, 190, 46);
+  ctx.textAlign = 'right'; ctx.font = '600 12px system-ui';
+  if (S.inn === 2) {
+    const need = S.target - S.runs, left = S.overs * 6 - S.balls;
+    ctx.fillText('TARGET ' + S.target, 300, 20);
+    ctx.font = '700 13px system-ui'; ctx.fillText(Math.max(need, 0) + ' off ' + left, 300, 42);
+  } else ctx.fillText('1st innings', 300, 20);
+  const recent = S.hist.slice(-6);
+  const cx0 = 12;
+  ctx.textAlign = 'center'; ctx.font = '700 11px system-ui';
+  recent.forEach((v, i) => {
+    const x = cx0 + 11 + i * 26;
+    ctx.fillStyle = v === 'W' ? '#ff5252' : v >= 4 ? '#7CFC9A' : '#ffffff33';
+    ctx.beginPath(); ctx.arc(x, 72, 9, 0, 7); ctx.fill();
+    ctx.fillStyle = v >= 4 && v !== 'W' ? '#08210f' : '#fff'; ctx.fillText(v, x, 76);
+  });
+}
+
+const MX = 316, MY = 104, MW = 16, MH = 190;
+function drawMeter(p) {
+  ctx.fillStyle = 'rgba(0,0,0,.5)'; rr(MX - 5, MY - 17, MW + 10, MH + 26, 8); ctx.fill();
+  const z = [[0, .18, '#e53935'], [.18, .33, '#fdd835'], [.33, .67, '#43a047'], [.67, .82, '#fdd835'], [.82, 1, '#e53935']];
+  for (const [a, b, c] of z) { ctx.fillStyle = c; ctx.fillRect(MX, MY + a * MH, MW, (b - a) * MH); }
+  ctx.fillStyle = '#c8ffd0'; ctx.fillRect(MX, MY + .46 * MH, MW, .08 * MH);
+  ctx.fillStyle = '#fff'; ctx.font = '700 9px system-ui'; ctx.textAlign = 'center'; ctx.fillText('AIM', MX + MW / 2, MY - 6);
+  if (p !== null && p !== undefined) {
+    const y = MY + p * MH;
+    ctx.fillStyle = '#fff'; ctx.fillRect(MX - 2, y - 1.5, MW + 4, 3);
+    ctx.beginPath(); ctx.moveTo(MX - 8, y - 5); ctx.lineTo(MX - 1, y); ctx.lineTo(MX - 8, y + 5); ctx.fill();
+  }
+}
+
+/* ---------- Ball Trajectory with Bounce ---------- */
+function computeDeliveryBall(ft, sway, bounceP) {
+  // ft in [0, 1] from bowler release hand (RELEASE_X, RELEASE_Y) to batter (BAT_HIT_X, BAT_HIT_Y)
+  const bx = RELEASE_X + (BAT_HIT_X - RELEASE_X) * ft + sway * Math.sin(ft * Math.PI);
+  const by = RELEASE_Y + (BAT_HIT_Y - RELEASE_Y) * ft;
+  const bFrac = 0.25 + bounceP * 0.48;
+  let lift = 0;
+  if (ft < bFrac) {
+    const u = ft / bFrac;
+    lift = 18 * (1 - u * u);
+  } else {
+    const u = (ft - bFrac) / (1 - bFrac);
+    lift = 14 * Math.sin(u * Math.PI * 0.82);
+  }
+  const r = 4.2 + ft * 3.8;
+  return { x: bx, y: by, lift, r, bFrac, bounceY: RELEASE_Y + (BAT_HIT_Y - RELEASE_Y) * bFrac };
+}
+
+/* ---------- Sync & Render 3D Scene ---------- */
+function render3DEntities(state) {
+  if (!threeCtx) return false;
+  const {
+    renderer, scene, camera,
+    batterRig, bowlerRig, fielderRigs, topStumps, botStumps, ballRig
+  } = threeCtx;
+
+  const batColor = state.batKit === MY_KIT ? 0x1e6fd9 : 0xe8590c;
+  const bowlColor = state.bowlKit === MY_KIT ? 0x1e6fd9 : 0xe8590c;
+  batterRig.kitMat.color.setHex(batColor);
+  bowlerRig.kitMat.color.setHex(bowlColor);
+
+  // Top & Bottom 3D Stumps
+  setCanvasPos(topStumps.wrap, W / 2, STUMP_TOP_Y, -40);
+  setCanvasPos(botStumps.wrap, W / 2, STUMP_BOT_Y, 60);
+
+  const wkT = state.wicketT || 0;
+  botStumps.stumps.forEach((s, idx) => {
+    if (wkT > 0 && idx >= 1) {
+      s.rotation.z = (idx === 1 ? -0.55 : 0.45) * wkT;
+      s.rotation.x = 0.65 * wkT;
+      s.position.y = 11 + wkT * 4;
+    } else {
+      s.rotation.set(0, 0, 0);
+      s.position.set((idx - 1) * 7, 11, 0);
+    }
+  });
+  botStumps.bails.forEach((b, idx) => {
+    if (wkT > 0) {
+      b.position.set((idx === 0 ? -3.5 : 3.5) + (idx === 0 ? -10 : 12) * wkT, 22.6 + Math.sin(wkT * Math.PI) * 16, wkT * 8);
+      b.rotation.z = Math.PI / 2 + wkT * 4;
+    } else {
+      b.position.set(idx === 0 ? -3.5 : 3.5, 22.6, 0);
+      b.rotation.z = Math.PI / 2;
+    }
+  });
+
+  // 3D Bowler at correct bowling position (left of top stumps, running up to popping crease)
+  setCanvasPos(bowlerRig.wrap, state.bowlX, state.bowlY, -25);
+  bowlerRig.root.scale.setScalar(0.95);
+  const ph = state.bowlPh;
+  const stride = Math.sin(ph * Math.PI * 2) * 0.55;
+  bowlerRig.leftLeg.rotation.x = stride;
+  bowlerRig.rightLeg.rotation.x = -stride;
+  bowlerRig.torso.rotation.x = ph > 0 ? 0.15 + Math.sin(ph * Math.PI) * 0.32 : 0.05;
+  bowlerRig.torso.rotation.y = ph > 0 ? Math.cos(ph * Math.PI) * 0.35 : 0;
+  bowlerRig.rightArmPivot.rotation.x = ph > 0 ? -ph * Math.PI * 2 : 0.2;
+  bowlerRig.leftArmPivot.rotation.x = ph > 0 ? Math.sin(ph * Math.PI) * 1.1 : -0.15;
+
+  // 3D Fielders around the oval facing the striker (or chasing hit ball)
+  const idleWave = Math.sin(state.now * 0.004) * 0.06;
+  FIELD.forEach(([fx, fy], idx) => {
+    const f = fielderRigs[idx];
+    f.kitMat.color.setHex(bowlColor);
+    setCanvasPos(f.wrap, fx, fy, (fy - 300) * 0.05);
+    const scale = 0.68 + ((fy - 180) / 400) * 0.16;
+    f.root.scale.setScalar(scale);
+    const targetX = state.ball ? state.ball.x : BAT_HIT_X;
+    const targetY = state.ball ? state.ball.y : BAT_HIT_Y;
+    const angToTarget = Math.atan2(targetX - fx, targetY - fy);
+    f.body.rotation.y = angToTarget;
+    f.torso.rotation.x = 0.28 + idleWave;
+    f.leftLeg.rotation.x = -0.22;
+    f.rightLeg.rotation.x = 0.22;
+    f.leftArmPivot.rotation.z = 0.35;
+    f.rightArmPivot.rotation.z = -0.35;
+    f.leftArmPivot.rotation.x = 0.45;
+    f.rightArmPivot.rotation.x = 0.45;
+  });
+
+  // 3D Batter standing IN FRONT of the bottom stumps at the popping crease
+  setCanvasPos(batterRig.wrap, BAT_STAND_X, BAT_STAND_Y, 35);
+  batterRig.root.scale.setScalar(1.06);
+  const sw = state.swing;
+  if (sw === null) {
+    const tap = Math.sin(state.now * 0.006) * 0.06;
+    batterRig.body.rotation.y = 0.62;
+    batterRig.torso.rotation.y = 0.08;
+    batterRig.batPivot.rotation.x = -0.35 + tap;
+    batterRig.batPivot.rotation.z = 0.22;
+    batterRig.batGroup.rotation.x = 0.25 + tap;
+  } else {
+    const ease = 1 - Math.pow(1 - sw, 2);
+    batterRig.body.rotation.y = 0.62 - ease * 0.45;
+    batterRig.torso.rotation.y = 0.08 - ease * 0.55;
+    batterRig.batPivot.rotation.x = -0.35 - Math.sin(ease * Math.PI * 0.9) * 2.15;
+    batterRig.batPivot.rotation.z = 0.22 + ease * 0.65;
+    batterRig.batGroup.rotation.x = 0.25 - ease * 0.85;
+  }
+
+  // 3D Cricket Ball (ONLY visible after release!)
+  if (state.ball) {
+    ballRig.wrap.visible = true;
+    setCanvasPos(ballRig.wrap, state.ball.x, state.ball.y, 48);
+    ballRig.meshGroup.position.set(0, state.ball.lift || 0, 6);
+    ballRig.meshGroup.scale.setScalar(state.ball.r);
+    ballRig.meshGroup.rotation.x = state.now * 0.025;
+    ballRig.meshGroup.rotation.y = state.now * 0.018;
+    ballRig.shadow.scale.set(Math.max(2.5, state.ball.r * 0.85), Math.max(1.4, state.ball.r * 0.45), 1);
+  } else {
+    ballRig.wrap.visible = false;
+  }
+
+  renderer.render(scene, camera);
+  ctx.drawImage(renderer.domElement, 0, 0, W, H);
+  return true;
+}
+
+/* ---------- Main Draw Loop ---------- */
+function draw() {
+  drawField();
+  const t = now();
+  let swing = null;
+  if (S.swing && t - S.swing < 260) swing = (t - S.swing) / 260;
+
+  const batKit = S.role === 'bat' ? MY_KIT : CPU_KIT;
+  const bowlKit = S.role === 'bat' ? CPU_KIT : MY_KIT;
+
+  let bowlPh = 0;
+  let bowlY = BOWL_START_Y;
+  let activeBall = null;
+  let timingRing = null;
+  let bounceMarkerY = null;
+  let meterVal = null;
+  let showMeter = false;
+
+  if (S.role === 'bat') {
+    if (S.phase === 'live' && S.live && !S.live.done) {
+      const L = S.live;
+      const tt = (t - L.t0) / L.D;
+      // Bowler runs up from BOWL_START_Y to BOWL_DELIV_Y and releases at tt = BAT_REL_T
+      const runProg = Math.min(1, tt / (BAT_REL_T * 1.6));
+      bowlPh = runProg;
+      bowlY = BOWL_START_Y + (BOWL_DELIV_Y - BOWL_START_Y) * Math.min(1, tt / BAT_REL_T);
+
+      // Ball is NOT shown before release (tt < BAT_REL_T)
+      if (tt >= BAT_REL_T) {
+        const ft = (tt - BAT_REL_T) / (IDEAL - BAT_REL_T);
+        activeBall = computeDeliveryBall(ft, L.sway, L.bounceP);
+        if (ft >= activeBall.bFrac) bounceMarkerY = activeBall.bounceY;
+      }
+
+      // Timing ring near the bat as ball approaches
+      const k = (tt - (IDEAL - .22)) / .25;
+      if (k > 0 && k < 1) {
+        const targetPos = computeDeliveryBall(1, L.sway, L.bounceP);
+        timingRing = { x: targetPos.x, y: targetPos.y, k };
+      }
+    } else if (S.phase === 'result') {
+      bowlPh = 1;
+      bowlY = BOWL_DELIV_Y;
+    }
+  } else {
+    // User is BOWLING
+    showMeter = true;
+    const R = S.res, inRes = S.phase === 'result' && R;
+    if (S.phase === 'live' && S.live && !S.live.done) {
+      if (!S.live.released) {
+        // Before colour selection: meter moves, bowler waits at mark, NO ball shown anywhere
+        meterVal = markerP();
+        bowlPh = 0;
+        bowlY = BOWL_START_Y;
+        activeBall = null;
+      } else {
+        // Colour selected! Bowler runs in (0..BOWL_RUNUP_MS) and releases ball at BOWL_RUNUP_MS
+        meterVal = S.live.p;
+        const elapsed = t - S.live.selectT;
+        const runFrac = Math.min(1, elapsed / BOWL_RUNUP_MS);
+        bowlY = BOWL_START_Y + (BOWL_DELIV_Y - BOWL_START_Y) * runFrac;
+        bowlPh = Math.min(1, elapsed / (BOWL_RUNUP_MS * 1.5));
+
+        // Ball is ONLY shown AFTER bowler reaches release point (elapsed >= BOWL_RUNUP_MS)
+        if (elapsed >= BOWL_RUNUP_MS) {
+          const ft = Math.min(1, (elapsed - BOWL_RUNUP_MS) / BOWL_FLIGHT_MS);
+          activeBall = computeDeliveryBall(ft, 0, S.live.p);
+          if (ft >= activeBall.bFrac) bounceMarkerY = activeBall.bounceY;
+        }
+      }
+    } else if (inRes) {
+      bowlPh = 1;
+      bowlY = BOWL_DELIV_Y;
+      meterVal = (R.flight && R.flight.p !== undefined) ? R.flight.p : null;
+    }
+  }
+
+  // Ball flight after batter hits it (or wicket animation)
+  let wicketT = 0;
+  if (S.res && S.phase === 'result') {
+    const R = S.res, k = Math.min(1, (t - R.t0) / 700), f = R.flight;
+    if (R.val === 'W') {
+      wicketT = Math.min(1, (t - R.t0) / 320);
+      const sy = STUMP_BOT_Y + k * 22;
+      activeBall = { x: W / 2 + k * 14, y: sy, lift: Math.sin(k * Math.PI) * 8, r: 6 };
+    } else if (R.val > 0) {
+      const e = 1 - Math.pow(1 - k, 2);
+      const x = f.from.x + Math.cos(f.ang) * f.dist * e;
+      const y = f.from.y + Math.sin(f.ang) * f.dist * e;
+      const lift = R.val === 6 ? Math.sin(k * Math.PI) * 48 : Math.sin(k * Math.PI) * 10;
+      if (k < 1) activeBall = { x, y, lift, r: R.val === 6 ? 5.5 + Math.sin(k * Math.PI) * 3.5 : 5.5 };
+    } else {
+      // Dot ball defended onto pitch near crease
+      const e = 1 - Math.pow(1 - k, 2);
+      activeBall = {
+        x: f.from.x + Math.cos(f.ang) * 24 * e,
+        y: f.from.y + Math.sin(f.ang) * 18 * e,
+        lift: Math.abs(Math.sin(k * Math.PI * 2)) * 4 * (1 - k),
+        r: 5.5
+      };
+    }
+  }
+
+  // Pitch bounce mark when ball has pitched
+  if (bounceMarkerY !== null) {
+    ctx.strokeStyle = 'rgba(255,255,255,.55)';
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    ctx.ellipse(W / 2, bounceMarkerY, 8, 4, 0, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // Timing ring on pitch for batting
+  if (timingRing) {
+    const k = timingRing.k;
+    const r = 30 - 22 * Math.min(1, k / .83);
+    ctx.globalAlpha = k < .83 ? .95 : 1 - (k - .83) / .17;
+    ctx.strokeStyle = '#ffd54a'; ctx.lineWidth = 3; ctx.shadowColor = '#ffd54a'; ctx.shadowBlur = 12;
+    ctx.beginPath(); ctx.arc(timingRing.x, timingRing.y, r, 0, 7); ctx.stroke();
+    ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+  }
+
+  // Render 3D scene (or 3D-shaded 2D fallback if WebGL unavailable)
+  const rendered3D = render3DEntities({
+    now: t,
+    batKit,
+    bowlKit,
+    bowlX: BOWL_X,
+    bowlY,
+    bowlPh,
+    swing,
+    ball: activeBall,
+    wicketT
+  });
+
+  if (!rendered3D) {
+    stumps2D(W / 2, STUMP_TOP_Y, 0);
+    for (const [fx, fy] of FIELD) bowlerFallback(fx, fy, bowlKit, 0, .66);
+    bowlerFallback(BOWL_X, bowlY, bowlKit, bowlPh, 1.0);
+    batterFallback(BAT_STAND_X, BAT_STAND_Y, batKit, swing, 1.08);
+    if (activeBall) ball3DCanvas(activeBall.x, activeBall.y, activeBall.r, activeBall.lift, '#c62828');
+    stumps2D(W / 2, STUMP_BOT_Y, wicketT);
+  }
+
+  if (showMeter) drawMeter(meterVal);
+
+  // Result banner overlay
+  if (S.res && S.phase === 'result') {
+    const R = S.res;
+    const fade = Math.min(1, (R.until - t) / 300), pop = Math.min(1, (t - R.t0) / 150);
+    ctx.globalAlpha = Math.max(0, fade);
+    ctx.textAlign = 'center'; ctx.fillStyle = R.color; ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(0,0,0,.5)';
+    ctx.font = `900 ${34 + 20 * (1 - Math.pow(1 - pop, 3))}px system-ui`;
+    ctx.strokeText(R.text, W / 2, 320); ctx.fillText(R.text, W / 2, 320);
+    ctx.font = '700 16px system-ui'; ctx.fillStyle = '#fff'; ctx.fillText(R.tag, W / 2, 350);
+    ctx.globalAlpha = 1;
+  }
+
+  // Hints
+  ctx.textAlign = 'center'; ctx.font = '600 14px system-ui'; ctx.fillStyle = 'rgba(255,255,255,.85)';
+  if (S.phase === 'live') {
+    if (S.role === 'bat') {
+      ctx.fillText('TAP as the ring closes — it is quick!', W / 2, 622);
+    } else if (!S.live.released) {
+      ctx.fillText('TAP to select colour & release the ball →', W / 2, 622);
+    } else {
+      ctx.fillText('Bowling delivery...', W / 2, 622);
+    }
+  }
+  hud();
+}
+
+function loop() {
+  update();
+  if (S.phase !== 'menu') draw();
+  else drawField();
+  requestAnimationFrame(loop);
+}
+menu(); loop();
+</script>
+</body>
+</html>
